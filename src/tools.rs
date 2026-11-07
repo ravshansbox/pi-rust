@@ -30,13 +30,36 @@ pub fn definitions() -> Value {
                 },
                 "required": ["path", "content"]
             }
+        },
+        {
+            "name": "edit",
+            "description": "Edit a file by replacing exact text. Each oldText must match exactly once in the original file, and edits must not overlap.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "edits": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "oldText": {"type": "string", "description": "Exact text to replace"},
+                                "newText": {"type": "string", "description": "Replacement text"}
+                            },
+                            "required": ["oldText", "newText"]
+                        }
+                    }
+                },
+                "required": ["path", "edits"]
+            }
         }
     ])
 }
 
 pub fn summary(name: &str, input: &Value) -> String {
     let detail = match name {
-        "read" | "write" => input.get("path"),
+        "read" | "write" | "edit" => input.get("path"),
         _ => None,
     }
     .and_then(Value::as_str)
@@ -48,6 +71,7 @@ pub async fn run(name: &str, input: &Value) -> Result<String, String> {
     let result = match name {
         "read" => read(input),
         "write" => write(input),
+        "edit" => edit(input),
         _ => Err(format!("unknown tool `{name}`")),
     };
     result.map(truncate).map_err(truncate)
@@ -82,6 +106,58 @@ fn write(input: &Value) -> Result<String, String> {
     fs::write(path, content).map_err(|error| format!("could not write {path}: {error}"))?;
 
     Ok(format!("wrote {} bytes to {path}", content.len()))
+}
+
+fn edit(input: &Value) -> Result<String, String> {
+    let path = text_field(input, "path")?;
+    let edits = input
+        .get("edits")
+        .and_then(Value::as_array)
+        .filter(|edits| !edits.is_empty())
+        .ok_or("`edits` must be a non-empty array")?;
+    let original =
+        fs::read_to_string(path).map_err(|error| format!("could not read {path}: {error}"))?;
+
+    let mut replacements = Vec::new();
+    for (index, edit) in edits.iter().enumerate() {
+        let number = index + 1;
+        let old_text =
+            text_field(edit, "oldText").map_err(|error| format!("edit {number}: {error}"))?;
+        let new_text =
+            text_field(edit, "newText").map_err(|error| format!("edit {number}: {error}"))?;
+        if old_text.is_empty() {
+            return Err(format!("edit {number}: `oldText` must not be empty"));
+        }
+
+        let mut matches = original.match_indices(old_text);
+        let Some((start, _)) = matches.next() else {
+            return Err(format!("edit {number}: `oldText` was not found in {path}"));
+        };
+        if matches.next().is_some() {
+            return Err(format!(
+                "edit {number}: `oldText` matches more than once in {path}; include more context"
+            ));
+        }
+        replacements.push((start, start + old_text.len(), new_text));
+    }
+
+    replacements.sort_by_key(|&(start, _, _)| start);
+    if replacements.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err("edits overlap; merge them into one edit".to_string());
+    }
+
+    let mut updated = String::new();
+    let mut position = 0;
+    for &(start, end, new_text) in &replacements {
+        updated.push_str(&original[position..start]);
+        updated.push_str(new_text);
+        position = end;
+    }
+    updated.push_str(&original[position..]);
+
+    fs::write(path, updated).map_err(|error| format!("could not write {path}: {error}"))?;
+
+    Ok(format!("applied {} edits to {path}", replacements.len()))
 }
 
 fn text_field<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -241,6 +317,79 @@ mod tests {
 
         assert_eq!(error, "`content` must be a string");
         assert!(!file.exists());
+    }
+
+    #[tokio::test]
+    async fn applies_several_edits() {
+        let file = scratch("edit").join("notes.txt");
+        fs::write(&file, "one\ntwo\nthree\n").unwrap();
+
+        let output = run(
+            "edit",
+            &json!({"path": path_text(&file), "edits": [
+                {"oldText": "three", "newText": "3"},
+                {"oldText": "one", "newText": "1"},
+            ]}),
+        )
+        .await;
+
+        assert_eq!(
+            output.unwrap(),
+            format!("applied 2 edits to {}", path_text(&file))
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "1\ntwo\n3\n");
+    }
+
+    #[tokio::test]
+    async fn rejects_text_that_is_not_found() {
+        let file = scratch("edit-missing").join("notes.txt");
+        fs::write(&file, "one\n").unwrap();
+
+        let error = run(
+            "edit",
+            &json!({"path": path_text(&file), "edits": [{"oldText": "two", "newText": "2"}]}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("edit 1: `oldText` was not found"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn rejects_text_that_matches_more_than_once_and_leaves_the_file_alone() {
+        let file = scratch("edit-ambiguous").join("notes.txt");
+        fs::write(&file, "one\none\n").unwrap();
+
+        let error = run(
+            "edit",
+            &json!({"path": path_text(&file), "edits": [
+                {"oldText": "\n", "newText": "!"},
+            ]}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("matches more than once"), "{error}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "one\none\n");
+    }
+
+    #[tokio::test]
+    async fn rejects_overlapping_edits() {
+        let file = scratch("edit-overlap").join("notes.txt");
+        fs::write(&file, "abcdef").unwrap();
+
+        let error = run(
+            "edit",
+            &json!({"path": path_text(&file), "edits": [
+                {"oldText": "abcd", "newText": "x"},
+                {"oldText": "cdef", "newText": "y"},
+            ]}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("edits overlap"), "{error}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "abcdef");
     }
 
     #[tokio::test]
