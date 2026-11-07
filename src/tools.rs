@@ -1,8 +1,12 @@
 use serde_json::{Value, json};
 use std::fs;
+use std::io::{self, Read};
 use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
 
 const OUTPUT_LIMIT: usize = 50_000;
+const DEFAULT_TIMEOUT_SECONDS: usize = 120;
 
 pub fn definitions() -> Value {
     json!([
@@ -53,6 +57,18 @@ pub fn definitions() -> Value {
                 },
                 "required": ["path", "edits"]
             }
+        },
+        {
+            "name": "bash",
+            "description": "Run a shell command with sh in the current directory. Returns stdout and stderr combined, followed by the exit code.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Command to run"},
+                    "timeout": {"type": "integer", "minimum": 1, "description": "Timeout in seconds (default 120)"}
+                },
+                "required": ["command"]
+            }
         }
     ])
 }
@@ -60,6 +76,7 @@ pub fn definitions() -> Value {
 pub fn summary(name: &str, input: &Value) -> String {
     let detail = match name {
         "read" | "write" | "edit" => input.get("path"),
+        "bash" => input.get("command"),
         _ => None,
     }
     .and_then(Value::as_str)
@@ -72,6 +89,7 @@ pub async fn run(name: &str, input: &Value) -> Result<String, String> {
         "read" => read(input),
         "write" => write(input),
         "edit" => edit(input),
+        "bash" => bash(input).await,
         _ => Err(format!("unknown tool `{name}`")),
     };
     result.map(truncate).map_err(truncate)
@@ -158,6 +176,50 @@ fn edit(input: &Value) -> Result<String, String> {
     fs::write(path, updated).map_err(|error| format!("could not write {path}: {error}"))?;
 
     Ok(format!("applied {} edits to {path}", replacements.len()))
+}
+
+async fn bash(input: &Value) -> Result<String, String> {
+    let command = text_field(input, "command")?;
+    let seconds = number_field(input, "timeout")?.unwrap_or(DEFAULT_TIMEOUT_SECONDS);
+    let (mut reader, writer) =
+        io::pipe().map_err(|error| format!("could not create a pipe: {error}"))?;
+    let error_writer = writer
+        .try_clone()
+        .map_err(|error| format!("could not create a pipe: {error}"))?;
+
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(error_writer)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("could not run `sh`: {error}"))?;
+
+    let reading = tokio::task::spawn_blocking(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).map(|_| output)
+    });
+    let finished = tokio::time::timeout(Duration::from_secs(seconds as u64), async {
+        (child.wait().await, reading.await)
+    })
+    .await;
+
+    let Ok((status, output)) = finished else {
+        let _ = child.kill().await;
+        return Err(format!("command timed out after {seconds} seconds"));
+    };
+    let status = status.map_err(|error| format!("could not wait for the command: {error}"))?;
+    let output = output
+        .map_err(|error| format!("could not read the command output: {error}"))?
+        .map_err(|error| format!("could not read the command output: {error}"))?;
+
+    let exit = match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "killed by a signal".to_string(),
+    };
+    Ok(format!("{}{exit}", String::from_utf8_lossy(&output)))
 }
 
 fn text_field<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -390,6 +452,34 @@ mod tests {
 
         assert!(error.contains("edits overlap"), "{error}");
         assert_eq!(fs::read_to_string(&file).unwrap(), "abcdef");
+    }
+
+    #[tokio::test]
+    async fn runs_a_command_with_combined_output_and_exit_code() {
+        let output = run(
+            "bash",
+            &json!({"command": "echo out; echo err >&2; echo again; exit 3"}),
+        )
+        .await;
+
+        assert_eq!(output.unwrap(), "out\nerr\nagain\nexit code 3");
+    }
+
+    #[tokio::test]
+    async fn runs_a_command_in_the_current_directory() {
+        let output = run("bash", &json!({"command": "pwd"})).await.unwrap();
+
+        let directory = env::current_dir().unwrap();
+        assert_eq!(output, format!("{}\nexit code 0", directory.display()));
+    }
+
+    #[tokio::test]
+    async fn stops_a_command_that_runs_too_long() {
+        let error = run("bash", &json!({"command": "sleep 5", "timeout": 1}))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "command timed out after 1 seconds");
     }
 
     #[tokio::test]
