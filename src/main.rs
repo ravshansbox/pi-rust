@@ -2,6 +2,8 @@ use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::process::{Command, ExitCode};
 
+mod tools;
+
 const CREDENTIALS_SERVICE: &str = "Claude Code-credentials";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -32,18 +34,61 @@ async fn run() -> Result<(), String> {
             continue;
         }
 
+        let checkpoint = messages.len();
         messages.push(json!({"role": "user", "content": prompt}));
 
-        match stream_reply(&client, &token, &messages).await {
-            Ok(content) => messages.push(json!({"role": "assistant", "content": content})),
-            Err(message) => {
-                eprintln!("{RESET}error: {message}");
-                messages.pop();
-            }
+        if let Err(message) = converse(&client, &token, &mut messages).await {
+            eprintln!("{RESET}error: {message}");
+            messages.truncate(checkpoint);
         }
     }
 
     Ok(())
+}
+
+async fn converse(
+    client: &reqwest::Client,
+    token: &str,
+    messages: &mut Vec<Value>,
+) -> Result<(), String> {
+    loop {
+        let content = stream_reply(client, token, messages).await?;
+        let calls: Vec<Value> = content
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .cloned()
+            .collect();
+        messages.push(json!({"role": "assistant", "content": content}));
+
+        if calls.is_empty() {
+            return Ok(());
+        }
+
+        let mut results = Vec::new();
+        for call in &calls {
+            results.push(use_tool(call).await);
+        }
+        messages.push(json!({"role": "user", "content": results}));
+    }
+}
+
+async fn use_tool(call: &Value) -> Value {
+    let name = call.get("name").and_then(Value::as_str).unwrap_or_default();
+    let input = &call["input"];
+    println!("{DIM}{}{RESET}", tools::summary(name, input));
+
+    let (output, is_error) = match tools::run(name, input).await {
+        Ok(output) => (output, false),
+        Err(error) => (error, true),
+    };
+    println!("{DIM}{}{RESET}\n", output.trim_end());
+
+    json!({
+        "type": "tool_result",
+        "tool_use_id": call["id"],
+        "content": output,
+        "is_error": is_error,
+    })
 }
 
 fn read_prompt() -> Result<Option<String>, String> {
@@ -148,6 +193,7 @@ fn request_body(messages: &[Value]) -> Value {
         "stream": true,
         "cache_control": {"type": "ephemeral"},
         "thinking": {"type": "adaptive", "display": "summarized"},
+        "tools": tools::definitions(),
         "messages": messages,
     })
 }
@@ -179,6 +225,7 @@ impl EventParser {
 #[derive(Default)]
 struct Reply {
     content: Vec<Value>,
+    partial_json: String,
 }
 
 impl Reply {
@@ -203,6 +250,11 @@ impl Reply {
                 Ok(self.append(delta, "thinking"))
             }
             (Some("content_block_delta"), Some("text_delta")) => Ok(self.append(delta, "text")),
+            (Some("content_block_delta"), Some("input_json_delta")) => {
+                self.partial_json
+                    .push_str(&delta_field(delta, "partial_json"));
+                Ok(String::new())
+            }
             (Some("content_block_delta"), Some("signature_delta")) => {
                 let signature = delta_field(delta, "signature");
                 if let Some(block) = self.content.last_mut() {
@@ -210,13 +262,27 @@ impl Reply {
                 }
                 Ok(String::new())
             }
-            (Some("content_block_stop"), _) => {
-                match self.content.last().and_then(|block| block.get("type")) {
-                    Some(block_type) if block_type == "thinking" => Ok(format!("{RESET}\n\n")),
-                    _ => Ok(String::new()),
-                }
-            }
+            (Some("content_block_stop"), _) => self.stop_block(),
             (Some("error"), _) => Err(describe_failure(0, event)),
+            _ => Ok(String::new()),
+        }
+    }
+
+    fn stop_block(&mut self) -> Result<String, String> {
+        let Some(block) = self.content.last_mut() else {
+            return Ok(String::new());
+        };
+
+        match block.get("type").and_then(Value::as_str) {
+            Some("thinking") => Ok(format!("{RESET}\n\n")),
+            Some("tool_use") => {
+                let partial_json = std::mem::take(&mut self.partial_json);
+                if !partial_json.is_empty() {
+                    block["input"] = serde_json::from_str(&partial_json)
+                        .map_err(|error| format!("tool input is not valid JSON: {error}"))?;
+                }
+                Ok(String::new())
+            }
             _ => Ok(String::new()),
         }
     }
@@ -231,16 +297,20 @@ impl Reply {
     }
 
     fn finish(self) -> Result<Vec<Value>, String> {
-        let has_text = self.content.iter().any(|block| {
-            block.get("type").and_then(Value::as_str) == Some("text")
-                && block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
-        });
+        let has_answer =
+            self.content
+                .iter()
+                .any(|block| match block.get("type").and_then(Value::as_str) {
+                    Some("text") => block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty()),
+                    Some("tool_use") => true,
+                    _ => false,
+                });
 
-        if !has_text {
-            return Err("response contained no text".to_string());
+        if !has_answer {
+            return Err("response contained no text or tool use".to_string());
         }
 
         Ok(self.content)
@@ -315,7 +385,48 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["cache_control"]["type"], "ephemeral");
         assert_eq!(body["thinking"]["display"], "summarized");
+        assert_eq!(body["tools"], tools::definitions());
         assert_eq!(body["messages"], json!(messages));
+    }
+
+    #[test]
+    fn assembles_a_tool_call_from_streamed_json() {
+        let events = [
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\": \"src/"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "main.rs\"}"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+        ];
+        let mut reply = Reply::default();
+
+        for event in &events {
+            reply.apply(event).unwrap();
+        }
+
+        assert_eq!(
+            reply.finish().unwrap(),
+            vec![
+                json!({"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "src/main.rs"}})
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_a_failed_tool_call_as_an_error_result() {
+        let call = json!({"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "/no/such/file"}});
+
+        let result = use_tool(&call).await;
+
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], "toolu_1");
+        assert_eq!(result["is_error"], true);
+        assert!(
+            result["content"]
+                .as_str()
+                .unwrap()
+                .contains("/no/such/file"),
+            "{result}"
+        );
     }
 
     #[test]
