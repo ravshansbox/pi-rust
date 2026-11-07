@@ -5,7 +5,7 @@ const CREDENTIALS_SERVICE: &str = "Claude Code-credentials";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
-const DEFAULT_MODEL: &str = "claude-opus-5-5";
+const MODEL: &str = "claude-opus-5-5";
 const PROMPT: &str = "Say hello.";
 const MAX_TOKENS: u32 = 1024;
 
@@ -21,15 +21,13 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), String> {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let model = parse_model_flag(&arguments)?;
     let token = access_token(&credentials_json()?)?;
 
     let response = reqwest::Client::new()
         .post(API_URL)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .bearer_auth(&token)
-        .json(&request_body(&model))
+        .json(&request_body())
         .send()
         .await
         .map_err(|error| format!("request failed: {error}"))?;
@@ -78,9 +76,9 @@ fn access_token(credentials: &str) -> Result<String, String> {
         })
 }
 
-fn request_body(model: &str) -> Value {
+fn request_body() -> Value {
     json!({
-        "model": model,
+        "model": MODEL,
         "max_tokens": MAX_TOKENS,
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": PROMPT}],
@@ -127,44 +125,12 @@ fn describe_failure(status: u16, body: &Value) -> String {
     format!("request failed with {status} {error_type}: {message}{hint}")
 }
 
-fn parse_model_flag(arguments: &[String]) -> Result<String, String> {
-    let mut model = None;
-    let mut index = 0;
-
-    while index < arguments.len() {
-        let argument = &arguments[index];
-
-        if argument == "--model" {
-            let value = arguments
-                .get(index + 1)
-                .ok_or_else(|| "--model needs a value".to_string())?;
-            model = Some(value.clone());
-            index += 2;
-        } else if let Some(value) = argument.strip_prefix("--model=") {
-            model = Some(value.to_string());
-            index += 1;
-        } else {
-            return Err(format!("unknown argument: {argument}"));
-        }
-    }
-
-    if model.as_deref() == Some("") {
-        return Err("--model cannot be empty".to_string());
-    }
-
-    Ok(model.unwrap_or_else(|| DEFAULT_MODEL.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const CREDENTIALS: &str =
         r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test","subscriptionType":"team"}}"#;
-
-    fn arguments(list: &[&str]) -> Vec<String> {
-        list.iter().map(|value| value.to_string()).collect()
-    }
 
     #[test]
     fn reads_the_access_token() {
@@ -185,8 +151,8 @@ mod tests {
 
     #[test]
     fn sends_the_claude_code_system_prompt() {
-        let body = request_body("claude-opus-5-5");
-        assert_eq!(body["model"], "claude-opus-5-5");
+        let body = request_body();
+        assert_eq!(body["model"], MODEL);
         assert_eq!(body["system"], SYSTEM_PROMPT);
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], PROMPT);
@@ -214,32 +180,5 @@ mod tests {
         let message = describe_failure(401, &body);
         assert!(message.contains("401"), "{message}");
         assert!(message.contains("run `claude`"), "{message}");
-    }
-
-    #[test]
-    fn defaults_the_model() {
-        assert_eq!(parse_model_flag(&[]).unwrap(), DEFAULT_MODEL);
-    }
-
-    #[test]
-    fn reads_the_model_flag() {
-        assert_eq!(
-            parse_model_flag(&arguments(&["--model", "claude-haiku-5-5"])).unwrap(),
-            "claude-haiku-5-5"
-        );
-        assert_eq!(
-            parse_model_flag(&arguments(&["--model=claude-sonnet-5-5"])).unwrap(),
-            "claude-sonnet-5-5"
-        );
-    }
-
-    #[test]
-    fn rejects_a_model_flag_without_a_value() {
-        assert!(parse_model_flag(&arguments(&["--model"])).is_err());
-    }
-
-    #[test]
-    fn rejects_unknown_arguments() {
-        assert!(parse_model_flag(&arguments(&["--verbose"])).is_err());
     }
 }
