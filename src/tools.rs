@@ -193,10 +193,12 @@ async fn bash(input: &Value) -> Result<String, String> {
         .stdin(Stdio::null())
         .stdout(writer)
         .stderr(error_writer)
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| format!("could not run `sh`: {error}"))?;
 
+    let process_group = child.id().map(|pid| format!("-{pid}"));
     let reading = tokio::task::spawn_blocking(move || {
         let mut output = Vec::new();
         reader.read_to_end(&mut output).map(|_| output)
@@ -207,6 +209,11 @@ async fn bash(input: &Value) -> Result<String, String> {
     .await;
 
     let Ok((status, output)) = finished else {
+        if let Some(process_group) = process_group {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &process_group])
+                .status();
+        }
         let _ = child.kill().await;
         return Err(format!("command timed out after {seconds} seconds"));
     };
@@ -480,6 +487,32 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, "command timed out after 1 seconds");
+    }
+
+    #[tokio::test]
+    async fn stops_the_processes_a_command_started_when_it_runs_too_long() {
+        let pid_file = scratch("bash-group").join("pid");
+        let command = format!("sleep 30 & echo $! > {}; wait", path_text(&pid_file));
+
+        run("bash", &json!({"command": command, "timeout": 1}))
+            .await
+            .unwrap_err();
+
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        let running = || {
+            std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .status()
+                .unwrap()
+                .success()
+        };
+        for _ in 0..20 {
+            if !running() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("process {} is still running", pid.trim());
     }
 
     #[tokio::test]
