@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 use std::fs;
+use std::path::Path;
 
 const OUTPUT_LIMIT: usize = 50_000;
 
@@ -17,13 +18,25 @@ pub fn definitions() -> Value {
                 },
                 "required": ["path"]
             }
+        },
+        {
+            "name": "write",
+            "description": "Write a file, replacing it if it exists. Creates parent directories.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "content": {"type": "string", "description": "Full content of the file"}
+                },
+                "required": ["path", "content"]
+            }
         }
     ])
 }
 
 pub fn summary(name: &str, input: &Value) -> String {
     let detail = match name {
-        "read" => input.get("path"),
+        "read" | "write" => input.get("path"),
         _ => None,
     }
     .and_then(Value::as_str)
@@ -34,6 +47,7 @@ pub fn summary(name: &str, input: &Value) -> String {
 pub async fn run(name: &str, input: &Value) -> Result<String, String> {
     let result = match name {
         "read" => read(input),
+        "write" => write(input),
         _ => Err(format!("unknown tool `{name}`")),
     };
     result.map(truncate).map_err(truncate)
@@ -55,6 +69,19 @@ fn read(input: &Value) -> Result<String, String> {
     }
 
     Ok(lines.iter().skip(offset - 1).take(limit).copied().collect())
+}
+
+fn write(input: &Value) -> Result<String, String> {
+    let path = text_field(input, "path")?;
+    let content = text_field(input, "content")?;
+
+    if let Some(parent) = Path::new(path).parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    }
+    fs::write(path, content).map_err(|error| format!("could not write {path}: {error}"))?;
+
+    Ok(format!("wrote {} bytes to {path}", content.len()))
 }
 
 fn text_field<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -94,7 +121,7 @@ fn truncate(text: String) -> String {
 mod tests {
     use super::*;
     use std::env;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
         let directory = env::temp_dir().join(format!("pi-rust-{}-{name}", std::process::id()));
@@ -170,6 +197,50 @@ mod tests {
             "{}",
             &output[OUTPUT_LIMIT - 20..]
         );
+    }
+
+    #[tokio::test]
+    async fn writes_a_file_and_its_parent_directories() {
+        let file = scratch("write").join("nested/notes.txt");
+
+        let output = run(
+            "write",
+            &json!({"path": path_text(&file), "content": "héllo\n"}),
+        )
+        .await;
+
+        assert_eq!(
+            output.unwrap(),
+            format!("wrote 7 bytes to {}", path_text(&file))
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "héllo\n");
+    }
+
+    #[tokio::test]
+    async fn replaces_an_existing_file() {
+        let file = scratch("write-replace").join("notes.txt");
+        fs::write(&file, "old content").unwrap();
+
+        run(
+            "write",
+            &json!({"path": path_text(&file), "content": "new"}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), "new");
+    }
+
+    #[tokio::test]
+    async fn requires_content_to_write() {
+        let file = scratch("write-missing").join("notes.txt");
+
+        let error = run("write", &json!({"path": path_text(&file)}))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "`content` must be a string");
+        assert!(!file.exists());
     }
 
     #[tokio::test]
