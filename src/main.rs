@@ -53,7 +53,7 @@ async fn converse(
 ) -> Result<(), String> {
     loop {
         let token = auth::access_token(client, credentials).await?;
-        let content = stream_reply(client, &token, messages).await?;
+        let (content, stop_reason) = stream_reply(client, &token, messages).await?;
         let calls: Vec<Value> = content
             .iter()
             .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
@@ -61,6 +61,9 @@ async fn converse(
             .collect();
         messages.push(json!({"role": "assistant", "content": content}));
 
+        if stop_reason.as_deref() == Some("pause_turn") {
+            continue;
+        }
         if calls.is_empty() {
             return Ok(());
         }
@@ -115,7 +118,7 @@ async fn stream_reply(
     client: &reqwest::Client,
     token: &str,
     messages: &[Value],
-) -> Result<Vec<Value>, String> {
+) -> Result<(Vec<Value>, Option<String>), String> {
     let mut response = client
         .post(API_URL)
         .header("anthropic-version", ANTHROPIC_VERSION)
@@ -197,6 +200,7 @@ impl EventParser {
 struct Reply {
     content: Vec<Value>,
     partial_json: String,
+    stop_reason: Option<String>,
 }
 
 impl Reply {
@@ -234,6 +238,13 @@ impl Reply {
                 Ok(String::new())
             }
             (Some("content_block_stop"), _) => self.stop_block(),
+            (Some("message_delta"), _) => {
+                self.stop_reason = delta
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                Ok(String::new())
+            }
             (Some("error"), _) => Err(describe_failure(0, event)),
             _ => Ok(String::new()),
         }
@@ -246,13 +257,23 @@ impl Reply {
 
         match block.get("type").and_then(Value::as_str) {
             Some("thinking") => Ok(format!("{RESET}\n\n")),
-            Some("tool_use") => {
+            Some("tool_use" | "server_tool_use") => {
                 let partial_json = std::mem::take(&mut self.partial_json);
                 if !partial_json.is_empty() {
                     block["input"] = serde_json::from_str(&partial_json)
                         .map_err(|error| format!("tool input is not valid JSON: {error}"))?;
                 }
-                Ok(String::new())
+                if block["type"] == "tool_use" {
+                    return Ok(String::new());
+                }
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Ok(format!(
+                    "{DIM}{}{RESET}\n",
+                    tools::summary(name, &block["input"])
+                ))
             }
             _ => Ok(String::new()),
         }
@@ -267,7 +288,7 @@ impl Reply {
         text
     }
 
-    fn finish(self) -> Result<Vec<Value>, String> {
+    fn finish(self) -> Result<(Vec<Value>, Option<String>), String> {
         let has_answer =
             self.content
                 .iter()
@@ -276,7 +297,7 @@ impl Reply {
                         .get("text")
                         .and_then(Value::as_str)
                         .is_some_and(|text| !text.is_empty()),
-                    Some("tool_use") => true,
+                    Some("tool_use" | "server_tool_use") => true,
                     _ => false,
                 });
 
@@ -284,7 +305,7 @@ impl Reply {
             return Err("response contained no text or tool use".to_string());
         }
 
-        Ok(self.content)
+        Ok((self.content, self.stop_reason))
     }
 }
 
@@ -355,7 +376,7 @@ mod tests {
         }
 
         assert_eq!(
-            reply.finish().unwrap(),
+            reply.finish().unwrap().0,
             vec![
                 json!({"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "src/main.rs"}})
             ]
@@ -422,12 +443,39 @@ mod tests {
 
         assert_eq!(output, format!("{DIM}hmm{RESET}\n\nhello"));
         assert_eq!(
-            reply.finish().unwrap(),
+            reply.finish().unwrap().0,
             vec![
                 json!({"type": "thinking", "thinking": "hmm", "signature": "sig"}),
                 json!({"type": "redacted_thinking", "data": "secret"}),
                 json!({"type": "text", "text": "hello"}),
             ]
+        );
+    }
+
+    #[test]
+    fn shows_a_server_tool_call_dimmed_and_reports_a_paused_turn() {
+        let events = [
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "srvtoolu_1", "name": "bash", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": \"ls\"}"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "pause_turn"}}),
+        ];
+        let mut reply = Reply::default();
+
+        let output: String = events
+            .iter()
+            .map(|event| reply.apply(event).unwrap())
+            .collect();
+
+        assert_eq!(output, format!("{DIM}bash ls{RESET}\n"));
+        assert_eq!(
+            reply.finish().unwrap(),
+            (
+                vec![
+                    json!({"type": "server_tool_use", "id": "srvtoolu_1", "name": "bash", "input": {"command": "ls"}})
+                ],
+                Some("pause_turn".to_string())
+            )
         );
     }
 
