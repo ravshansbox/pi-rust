@@ -4,7 +4,7 @@ A minimal coding agent for the terminal, written in Rust. It is a proof of conce
 
 ## Requirements
 
-- macOS (sign-in opens the browser with `open`)
+- macOS or Linux (the `bash` tool needs `sh` and `kill`)
 - Rust (edition 2024)
 - A Claude account
 
@@ -14,7 +14,7 @@ A minimal coding agent for the terminal, written in Rust. It is a proof of conce
 cargo run
 ```
 
-On first run, pi-rust opens a browser to sign in to Claude. Paste the code it shows back into the terminal. The credentials are saved in `~/.config/pi-rust/credentials.json`, readable only by you, and refreshed when they expire. Delete the file to sign in again.
+On first run, pi-rust shows a URL. Open it in your browser, sign in to Claude and paste the code it shows back into the terminal. The credentials are saved in `~/.config/pi-rust/credentials.json`, readable only by you, and refreshed when they expire. Delete the file to sign in again.
 
 Type a prompt after `>` and press Enter. Press Ctrl+D to quit.
 

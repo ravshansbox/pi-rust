@@ -5,7 +5,6 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CREDENTIALS_PATH: &str = ".config/pi-rust/credentials.json";
@@ -108,8 +107,7 @@ pub async fn access_token(
 async fn sign_in(client: &reqwest::Client) -> Result<Credentials, String> {
     let verifier = verifier()?;
     let url = sign_in_url(&verifier);
-    println!("sign in to Claude in your browser, then paste the code here:\n{url}");
-    let _ = Command::new("open").arg(url.as_str()).status();
+    println!("open this URL in your browser, sign in to Claude, then paste the code here:\n{url}");
 
     let input = crate::read_prompt()?.ok_or("sign-in cancelled")?;
     let code = pasted_code(&input, &verifier)?;
