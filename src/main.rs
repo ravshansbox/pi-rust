@@ -8,7 +8,7 @@ mod tools;
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
-const MODEL: &str = "claude-opus-5-5";
+const DEFAULT_MODEL: &str = "claude-opus-5-5";
 const MAX_TOKENS: u32 = 16000;
 const MAX_PAUSES: usize = 5;
 const DIM: &str = "\x1b[2m";
@@ -26,6 +26,8 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), String> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let model = parse_model_flag(&arguments)?;
     let client = reqwest::Client::new();
     let mut credentials = auth::credentials(&client).await?;
     let mut messages: Vec<Value> = Vec::new();
@@ -38,7 +40,7 @@ async fn run() -> Result<(), String> {
         let checkpoint = messages.len();
         messages.push(json!({"role": "user", "content": prompt}));
 
-        if let Err(message) = converse(&client, &mut credentials, &mut messages).await {
+        if let Err(message) = converse(&client, &model, &mut credentials, &mut messages).await {
             eprintln!("{RESET}error: {message}");
             messages.truncate(checkpoint);
         }
@@ -49,13 +51,14 @@ async fn run() -> Result<(), String> {
 
 async fn converse(
     client: &reqwest::Client,
+    model: &str,
     credentials: &mut auth::Credentials,
     messages: &mut Vec<Value>,
 ) -> Result<(), String> {
     let mut pauses = 0;
     loop {
         let token = auth::access_token(client, credentials).await?;
-        let (content, stop_reason) = stream_reply(client, &token, messages).await?;
+        let (content, stop_reason) = stream_reply(client, model, &token, messages).await?;
         let calls: Vec<Value> = content
             .iter()
             .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
@@ -129,6 +132,7 @@ fn read_prompt() -> Result<Option<String>, String> {
 
 async fn stream_reply(
     client: &reqwest::Client,
+    model: &str,
     token: &str,
     messages: &[Value],
 ) -> Result<(Vec<Value>, Option<String>), String> {
@@ -136,7 +140,7 @@ async fn stream_reply(
         .post(API_URL)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .bearer_auth(token)
-        .json(&request_body(messages))
+        .json(&request_body(model, messages))
         .send()
         .await
         .map_err(|error| format!("request failed: {error}"))?;
@@ -172,9 +176,9 @@ async fn stream_reply(
     reply.finish()
 }
 
-fn request_body(messages: &[Value]) -> Value {
+fn request_body(model: &str, messages: &[Value]) -> Value {
     json!({
-        "model": MODEL,
+        "model": model,
         "max_tokens": MAX_TOKENS,
         "system": SYSTEM_PROMPT,
         "stream": true,
@@ -353,9 +357,69 @@ fn describe_failure(status: u16, body: &Value) -> String {
     }
 }
 
+fn parse_model_flag(arguments: &[String]) -> Result<String, String> {
+    let mut model = None;
+    let mut index = 0;
+
+    while index < arguments.len() {
+        let argument = &arguments[index];
+
+        if argument == "--model" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "--model needs a value".to_string())?;
+            model = Some(value.clone());
+            index += 2;
+        } else if let Some(value) = argument.strip_prefix("--model=") {
+            model = Some(value.to_string());
+            index += 1;
+        } else {
+            return Err(format!("unknown argument: {argument}"));
+        }
+    }
+
+    if model.as_deref() == Some("") {
+        return Err("--model cannot be empty".to_string());
+    }
+
+    Ok(model.unwrap_or_else(|| DEFAULT_MODEL.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn arguments(list: &[&str]) -> Vec<String> {
+        list.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn defaults_the_model() {
+        assert_eq!(parse_model_flag(&[]).unwrap(), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn reads_the_model_flag() {
+        assert_eq!(
+            parse_model_flag(&arguments(&["--model", "claude-haiku-5-5"])).unwrap(),
+            "claude-haiku-5-5"
+        );
+        assert_eq!(
+            parse_model_flag(&arguments(&["--model=claude-sonnet-5-5"])).unwrap(),
+            "claude-sonnet-5-5"
+        );
+    }
+
+    #[test]
+    fn rejects_a_model_flag_without_a_value() {
+        assert!(parse_model_flag(&arguments(&["--model"])).is_err());
+        assert!(parse_model_flag(&arguments(&["--model="])).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_arguments() {
+        assert!(parse_model_flag(&arguments(&["--verbose"])).is_err());
+    }
 
     #[test]
     fn sends_the_conversation_as_a_cached_stream_with_visible_thinking() {
@@ -364,8 +428,8 @@ mod tests {
             json!({"role": "assistant", "content": [{"type": "text", "text": "hello"}]}),
             json!({"role": "user", "content": "how are you?"}),
         ];
-        let body = request_body(&messages);
-        assert_eq!(body["model"], MODEL);
+        let body = request_body("claude-haiku-5-5", &messages);
+        assert_eq!(body["model"], "claude-haiku-5-5");
         assert_eq!(body["system"], SYSTEM_PROMPT);
         assert_eq!(body["stream"], true);
         assert_eq!(body["cache_control"]["type"], "ephemeral");
