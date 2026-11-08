@@ -46,3 +46,7 @@ cargo test
 ## Decisions
 
 See [docs/adr](docs/adr).
+
+## Licence
+
+[MIT](LICENSE)
