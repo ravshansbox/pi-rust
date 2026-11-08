@@ -69,7 +69,8 @@ pub fn definitions() -> Value {
                 },
                 "required": ["command"]
             }
-        }
+        },
+        {"type": "web_fetch_20250910", "name": "web_fetch"}
     ])
 }
 
@@ -77,6 +78,7 @@ pub fn summary(name: &str, input: &Value) -> String {
     let detail = match name {
         "read" | "write" | "edit" => input.get("path"),
         "bash" => input.get("command"),
+        "web_fetch" => input.get("url"),
         _ => None,
     }
     .and_then(Value::as_str)
@@ -513,6 +515,22 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         panic!("process {} is still running", pid.trim());
+    }
+
+    #[test]
+    fn offers_web_fetch_run_by_anthropic() {
+        let definitions = definitions();
+
+        assert!(
+            definitions
+                .as_array()
+                .unwrap()
+                .contains(&json!({"type": "web_fetch_20250910", "name": "web_fetch"}))
+        );
+        assert_eq!(
+            summary("web_fetch", &json!({"url": "https://example.com"})),
+            "web_fetch https://example.com"
+        );
     }
 
     #[tokio::test]
