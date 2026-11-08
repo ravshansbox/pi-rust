@@ -38,6 +38,10 @@ pi-rust --model claude-sonnet-5-5
 
 To run from a clone without installing, use `cargo run`. Pass flags after `--`, for example `cargo run -- --model claude-sonnet-5-5`.
 
+## Instructions
+
+pi-rust follows the [AGENTS.md](https://agents.md) spec. At startup, it reads every `AGENTS.md` from the current directory up to the filesystem root and adds them to the system prompt, outermost first, so the nearest file takes precedence. Missing or empty files are skipped. Restart pi-rust to pick up changes.
+
 ## Tools
 
 The model can use these tools:

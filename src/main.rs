@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 mod auth;
+mod instructions;
 mod tools;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -30,6 +31,7 @@ async fn run() -> Result<(), String> {
     let model = parse_model_flag(&arguments)?;
     let client = reqwest::Client::new();
     let mut credentials = auth::credentials(&client).await?;
+    let system = instructions::system_prompt(SYSTEM_PROMPT, &instructions::load()?);
     let mut messages: Vec<Value> = Vec::new();
 
     while let Some(prompt) = read_prompt()? {
@@ -40,7 +42,9 @@ async fn run() -> Result<(), String> {
         let checkpoint = messages.len();
         messages.push(json!({"role": "user", "content": prompt}));
 
-        if let Err(message) = converse(&client, &model, &mut credentials, &mut messages).await {
+        if let Err(message) =
+            converse(&client, &model, &system, &mut credentials, &mut messages).await
+        {
             eprintln!("{RESET}error: {message}");
             messages.truncate(checkpoint);
         }
@@ -52,13 +56,14 @@ async fn run() -> Result<(), String> {
 async fn converse(
     client: &reqwest::Client,
     model: &str,
+    system: &Value,
     credentials: &mut auth::Credentials,
     messages: &mut Vec<Value>,
 ) -> Result<(), String> {
     let mut pauses = 0;
     loop {
         let token = auth::access_token(client, credentials).await?;
-        let (content, stop_reason) = stream_reply(client, model, &token, messages).await?;
+        let (content, stop_reason) = stream_reply(client, model, system, &token, messages).await?;
         if content.is_empty() {
             return Ok(());
         }
@@ -153,6 +158,7 @@ fn read_prompt() -> Result<Option<String>, String> {
 async fn stream_reply(
     client: &reqwest::Client,
     model: &str,
+    system: &Value,
     token: &str,
     messages: &[Value],
 ) -> Result<(Vec<Value>, Option<String>), String> {
@@ -160,7 +166,7 @@ async fn stream_reply(
         .post(API_URL)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .bearer_auth(token)
-        .json(&request_body(model, messages))
+        .json(&request_body(model, system, messages))
         .send()
         .await
         .map_err(|error| format!("request failed: {error}"))?;
@@ -196,11 +202,11 @@ async fn stream_reply(
     reply.finish()
 }
 
-fn request_body(model: &str, messages: &[Value]) -> Value {
+fn request_body(model: &str, system: &Value, messages: &[Value]) -> Value {
     json!({
         "model": model,
         "max_tokens": MAX_TOKENS,
-        "system": SYSTEM_PROMPT,
+        "system": system,
         "stream": true,
         "cache_control": {"type": "ephemeral"},
         "thinking": {"type": "adaptive", "display": "summarized"},
@@ -457,9 +463,10 @@ mod tests {
             json!({"role": "assistant", "content": [{"type": "text", "text": "hello"}]}),
             json!({"role": "user", "content": "how are you?"}),
         ];
-        let body = request_body("claude-haiku-5-5", &messages);
+        let system = json!([{"type": "text", "text": SYSTEM_PROMPT}]);
+        let body = request_body("claude-haiku-5-5", &system, &messages);
         assert_eq!(body["model"], "claude-haiku-5-5");
-        assert_eq!(body["system"], SYSTEM_PROMPT);
+        assert_eq!(body["system"], system);
         assert_eq!(body["stream"], true);
         assert_eq!(body["cache_control"]["type"], "ephemeral");
         assert_eq!(body["thinking"]["display"], "summarized");
