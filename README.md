@@ -38,6 +38,10 @@ pi-rust --model claude-sonnet-5-5
 
 To run from a clone without installing, use `cargo run`. Pass flags after `--`, for example `cargo run -- --model claude-sonnet-5-5`.
 
+## Output
+
+Replies are markdown. In a terminal, pi-rust shows them styled, one block at a time: headings and bold in bold, italics, code in cyan, lists with bullets and links followed by their URL. Tables stay as raw text. When the output is not a terminal, for example `pi-rust | tee log`, replies stay as raw markdown.
+
 ## Instructions
 
 pi-rust follows the [AGENTS.md](https://agents.md) spec. At startup, it reads every `AGENTS.md` from the current directory up to the filesystem root and adds them to the system prompt, outermost first, so the nearest file takes precedence. Missing or empty files are skipped. Restart pi-rust to pick up changes.

@@ -1,9 +1,10 @@
 use serde_json::{Value, json};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
 mod auth;
 mod instructions;
+mod markdown;
 mod tools;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -181,7 +182,10 @@ async fn stream_reply(
     }
 
     let mut parser = EventParser::default();
-    let mut reply = Reply::default();
+    let mut reply = Reply {
+        markdown: io::stdout().is_terminal(),
+        ..Reply::default()
+    };
     let mut stdout = io::stdout();
 
     while let Some(chunk) = response
@@ -245,6 +249,8 @@ struct Reply {
     partial_json: String,
     invalid_input: Option<String>,
     stop_reason: Option<String>,
+    markdown: bool,
+    renderer: markdown::Renderer,
 }
 
 impl Reply {
@@ -262,13 +268,21 @@ impl Reply {
                     Some("thinking") => DIM,
                     _ => "",
                 };
+                self.renderer = markdown::Renderer::default();
                 self.content.push(block);
                 Ok(output.to_string())
             }
             (Some("content_block_delta"), Some("thinking_delta")) => {
                 Ok(self.append(delta, "thinking"))
             }
-            (Some("content_block_delta"), Some("text_delta")) => Ok(self.append(delta, "text")),
+            (Some("content_block_delta"), Some("text_delta")) => {
+                let text = self.append(delta, "text");
+                if self.markdown {
+                    Ok(self.renderer.push(&text))
+                } else {
+                    Ok(text)
+                }
+            }
             (Some("content_block_delta"), Some("input_json_delta")) => {
                 self.partial_json
                     .push_str(&delta_field(delta, "partial_json"));
@@ -301,6 +315,7 @@ impl Reply {
 
         match block.get("type").and_then(Value::as_str) {
             Some("thinking") => Ok(format!("{RESET}\n\n")),
+            Some("text") if self.markdown => Ok(self.renderer.finish()),
             Some("tool_use" | "server_tool_use") => {
                 let partial_json = std::mem::take(&mut self.partial_json);
                 if !partial_json.is_empty() {
@@ -562,6 +577,39 @@ mod tests {
                 json!({"type": "redacted_thinking", "data": "secret"}),
                 json!({"type": "text", "text": "hello"}),
             ]
+        );
+    }
+
+    #[test]
+    fn renders_markdown_text_when_asked() {
+        let events = [
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "**hi**\n\n"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "*there*"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+        ];
+        let mut reply = Reply {
+            markdown: true,
+            ..Reply::default()
+        };
+
+        let output: Vec<String> = events
+            .iter()
+            .map(|event| reply.apply(event).unwrap())
+            .collect();
+
+        assert_eq!(
+            output,
+            [
+                String::new(),
+                "\x1b[1mhi\x1b[0m".to_string(),
+                String::new(),
+                "\n\n\x1b[3mthere\x1b[0m".to_string(),
+            ]
+        );
+        assert_eq!(
+            reply.finish().unwrap().0,
+            vec![json!({"type": "text", "text": "**hi**\n\n*there*"})]
         );
     }
 
