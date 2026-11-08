@@ -80,7 +80,12 @@ async fn converse(
 
         let mut results = Vec::new();
         for call in &calls {
-            results.push(use_tool(call).await);
+            let result = if stop_reason.as_deref() == Some("max_tokens") {
+                skip_truncated_tool(call)
+            } else {
+                use_tool(call).await
+            };
+            results.push(result);
         }
         messages.push(json!({"role": "user", "content": results}));
     }
@@ -111,6 +116,18 @@ async fn use_tool(call: &Value) -> Value {
         "tool_use_id": call["id"],
         "content": output,
         "is_error": is_error,
+    })
+}
+
+fn skip_truncated_tool(call: &Value) -> Value {
+    let name = call.get("name").and_then(Value::as_str).unwrap_or_default();
+    println!("{DIM}{name} skipped: the reply hit the output token limit{RESET}\n");
+
+    json!({
+        "type": "tool_result",
+        "tool_use_id": call["id"],
+        "content": format!("`{name}` was not run: the reply hit the output token limit, so its input may be cut off. Call it again with complete input."),
+        "is_error": true,
     })
 }
 
@@ -220,6 +237,7 @@ impl EventParser {
 struct Reply {
     content: Vec<Value>,
     partial_json: String,
+    invalid_input: Option<String>,
     stop_reason: Option<String>,
 }
 
@@ -280,8 +298,14 @@ impl Reply {
             Some("tool_use" | "server_tool_use") => {
                 let partial_json = std::mem::take(&mut self.partial_json);
                 if !partial_json.is_empty() {
-                    block["input"] = serde_json::from_str(&partial_json)
-                        .map_err(|error| format!("tool input is not valid JSON: {error}"))?;
+                    match serde_json::from_str(&partial_json) {
+                        Ok(input) => block["input"] = input,
+                        Err(error) => {
+                            block["input"] = json!({});
+                            self.invalid_input
+                                .get_or_insert(format!("tool input is not valid JSON: {error}"));
+                        }
+                    }
                 }
                 if block["type"] == "tool_use" {
                     return Ok(String::new());
@@ -309,6 +333,12 @@ impl Reply {
     }
 
     fn finish(self) -> Result<(Vec<Value>, Option<String>), String> {
+        if let Some(error) = self.invalid_input
+            && self.stop_reason.as_deref() != Some("max_tokens")
+        {
+            return Err(error);
+        }
+
         let content = self
             .content
             .into_iter()
@@ -583,6 +613,64 @@ mod tests {
         assert_eq!(
             reply.finish().unwrap(),
             (vec![], Some("end_turn".to_string()))
+        );
+    }
+
+    #[test]
+    fn keeps_a_tool_call_cut_off_by_the_token_limit() {
+        let events = [
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "write", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\": \"a.txt\", \"content\": \"hel"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}),
+        ];
+        let mut reply = Reply::default();
+
+        for event in &events {
+            reply.apply(event).unwrap();
+        }
+
+        assert_eq!(
+            reply.finish().unwrap(),
+            (
+                vec![json!({"type": "tool_use", "id": "toolu_1", "name": "write", "input": {}})],
+                Some("max_tokens".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn reports_invalid_tool_input_when_the_reply_was_not_cut_off() {
+        let events = [
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\""}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+        ];
+        let mut reply = Reply::default();
+
+        for event in &events {
+            reply.apply(event).unwrap();
+        }
+
+        let error = reply.finish().unwrap_err();
+        assert!(error.contains("not valid JSON"), "{error}");
+    }
+
+    #[test]
+    fn skips_a_tool_call_cut_off_by_the_token_limit() {
+        let call = json!({"type": "tool_use", "id": "toolu_1", "name": "write", "input": {}});
+
+        let result = skip_truncated_tool(&call);
+
+        assert_eq!(result["tool_use_id"], "toolu_1");
+        assert_eq!(result["is_error"], true);
+        assert!(
+            result["content"]
+                .as_str()
+                .unwrap()
+                .contains("output token limit"),
+            "{result}"
         );
     }
 
