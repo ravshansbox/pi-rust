@@ -59,6 +59,9 @@ async fn converse(
     loop {
         let token = auth::access_token(client, credentials).await?;
         let (content, stop_reason) = stream_reply(client, model, &token, messages).await?;
+        if content.is_empty() {
+            return Ok(());
+        }
         let calls: Vec<Value> = content
             .iter()
             .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
@@ -306,23 +309,19 @@ impl Reply {
     }
 
     fn finish(self) -> Result<(Vec<Value>, Option<String>), String> {
-        let has_answer =
-            self.content
-                .iter()
-                .any(|block| match block.get("type").and_then(Value::as_str) {
-                    Some("text") => block
+        let content = self
+            .content
+            .into_iter()
+            .filter(|block| {
+                block.get("type").and_then(Value::as_str) != Some("text")
+                    || block
                         .get("text")
                         .and_then(Value::as_str)
-                        .is_some_and(|text| !text.is_empty()),
-                    Some("tool_use" | "server_tool_use") => true,
-                    _ => false,
-                });
+                        .is_some_and(|text| !text.trim().is_empty())
+            })
+            .collect();
 
-        if !has_answer {
-            return Err("response contained no text or tool use".to_string());
-        }
-
-        Ok((self.content, self.stop_reason))
+        Ok((content, self.stop_reason))
     }
 }
 
@@ -568,13 +567,23 @@ mod tests {
     }
 
     #[test]
-    fn reports_a_reply_without_text() {
+    fn drops_empty_text_from_a_reply() {
+        let events = [
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "\n"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        ];
         let mut reply = Reply::default();
-        reply
-            .apply(&json!({"type": "content_block_start", "content_block": {"type": "text", "text": ""}}))
-            .unwrap();
-        let error = reply.finish().unwrap_err();
-        assert!(error.contains("no text"), "{error}");
+
+        for event in &events {
+            reply.apply(event).unwrap();
+        }
+
+        assert_eq!(
+            reply.finish().unwrap(),
+            (vec![], Some("end_turn".to_string()))
+        );
     }
 
     #[test]
