@@ -7,6 +7,9 @@ use std::time::Duration;
 
 const OUTPUT_LIMIT: usize = 50_000;
 const DEFAULT_TIMEOUT_SECONDS: usize = 120;
+const OUTPUT_IDLE: Duration = Duration::from_millis(100);
+
+type Chunks = tokio::sync::mpsc::UnboundedReceiver<Result<Vec<u8>, String>>;
 
 pub fn definitions() -> Value {
     json!([
@@ -185,7 +188,7 @@ fn edit(input: &Value) -> Result<String, String> {
 async fn bash(input: &Value) -> Result<String, String> {
     let command = text_field(input, "command")?;
     let seconds = number_field(input, "timeout")?.unwrap_or(DEFAULT_TIMEOUT_SECONDS);
-    let (mut reader, writer) =
+    let (reader, writer) =
         io::pipe().map_err(|error| format!("could not create a pipe: {error}"))?;
     let error_writer = writer
         .try_clone()
@@ -203,16 +206,14 @@ async fn bash(input: &Value) -> Result<String, String> {
         .map_err(|error| format!("could not run `sh`: {error}"))?;
 
     let process_group = child.id().map(|pid| format!("-{pid}"));
-    let reading = tokio::task::spawn_blocking(move || {
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output).map(|_| output)
-    });
-    let finished = tokio::time::timeout(Duration::from_secs(seconds as u64), async {
-        (child.wait().await, reading.await)
-    })
+    let chunks = read_chunks(reader);
+    let finished = tokio::time::timeout(
+        Duration::from_secs(seconds as u64),
+        collect_output(&mut child, chunks),
+    )
     .await;
 
-    let Ok((status, output)) = finished else {
+    let Ok(finished) = finished else {
         if let Some(process_group) = process_group {
             let _ = std::process::Command::new("kill")
                 .args(["-KILL", "--", &process_group])
@@ -221,16 +222,61 @@ async fn bash(input: &Value) -> Result<String, String> {
         let _ = child.kill().await;
         return Err(format!("command timed out after {seconds} seconds"));
     };
-    let status = status.map_err(|error| format!("could not wait for the command: {error}"))?;
-    let output = output
-        .map_err(|error| format!("could not read the command output: {error}"))?
-        .map_err(|error| format!("could not read the command output: {error}"))?;
+    let (status, output) = finished?;
 
     let exit = match status.code() {
         Some(code) => format!("exit code {code}"),
         None => "killed by a signal".to_string(),
     };
     Ok(format!("{}{exit}", String::from_utf8_lossy(&output)))
+}
+
+// A plain thread, not spawn_blocking: a background process can hold the pipe open
+// forever, and tokio waits for blocking tasks when it shuts down.
+fn read_chunks(mut reader: io::PipeReader) -> Chunks {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                // Keep draining after the tool returns, so a background process
+                // isn't killed by a closed pipe the next time it writes.
+                Ok(read) => {
+                    let _ = sender.send(Ok(buffer[..read].to_vec()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    let _ = sender.send(Err(format!("could not read the command output: {error}")));
+                    break;
+                }
+            }
+        }
+    });
+    receiver
+}
+
+// Read until the shell exits, then until the output goes quiet or ends. Waiting for
+// the pipe to close would hang on a background process that inherited it.
+async fn collect_output(
+    child: &mut tokio::process::Child,
+    mut chunks: Chunks,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    let mut output = Vec::new();
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => {
+                break status.map_err(|error| format!("could not wait for the command: {error}"))?;
+            }
+            Some(chunk) = chunks.recv() => output.extend_from_slice(&chunk?),
+        }
+    };
+
+    while let Ok(Some(chunk)) = tokio::time::timeout(OUTPUT_IDLE, chunks.recv()).await {
+        output.extend_from_slice(&chunk?);
+    }
+
+    Ok((status, output))
 }
 
 fn text_field<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -517,6 +563,28 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         panic!("process {} is still running", pid.trim());
+    }
+
+    #[tokio::test]
+    async fn returns_when_the_command_exits_and_leaves_a_background_process_running() {
+        let pid_file = scratch("bash-background").join("pid");
+        let command = format!(
+            "sleep 30 & echo $! > {}; echo started",
+            path_text(&pid_file)
+        );
+        let started = std::time::Instant::now();
+
+        let output = run("bash", &json!({"command": command, "timeout": 10})).await;
+
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        let running = std::process::Command::new("kill")
+            .arg(pid.trim())
+            .status()
+            .unwrap()
+            .success();
+        assert_eq!(output.unwrap(), "started\nexit code 0");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(running, "the background process was stopped");
     }
 
     #[test]
