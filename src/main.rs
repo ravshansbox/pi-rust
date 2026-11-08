@@ -347,8 +347,8 @@ fn describe_failure(status: u16, body: &Value) -> String {
         .unwrap_or("no message");
 
     let hint = match status {
-        401 | 403 => "; run `security delete-generic-password -s pi-rust` to sign in again",
-        _ => "",
+        401 | 403 => format!("; {}", auth::SIGN_IN_AGAIN),
+        _ => String::new(),
     };
 
     match status {
@@ -590,6 +590,9 @@ mod tests {
         let body = json!({"error": {"type": "authentication_error", "message": "invalid"}});
         let message = describe_failure(401, &body);
         assert!(message.contains("401"), "{message}");
-        assert!(message.contains("delete-generic-password"), "{message}");
+        assert!(
+            message.contains(".config/pi-rust/credentials.json"),
+            "{message}"
+        );
     }
 }

@@ -2,12 +2,14 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::Read;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const KEYCHAIN_SERVICE: &str = "pi-rust";
+const CREDENTIALS_PATH: &str = ".config/pi-rust/credentials.json";
+pub const SIGN_IN_AGAIN: &str = "delete ~/.config/pi-rust/credentials.json to sign in again";
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
@@ -76,7 +78,7 @@ impl Credentials {
 }
 
 pub async fn credentials(client: &reqwest::Client) -> Result<Credentials, String> {
-    match load()? {
+    match load(&credentials_path()?)? {
         Some(credentials) => Ok(credentials),
         None => sign_in(client).await,
     }
@@ -97,7 +99,7 @@ pub async fn access_token(
         )
         .await?;
         *credentials = Credentials::from_response(&response, now())?;
-        save(credentials)?;
+        save(&credentials_path()?, credentials)?;
     }
 
     Ok(credentials.access.clone())
@@ -125,7 +127,7 @@ async fn sign_in(client: &reqwest::Client) -> Result<Credentials, String> {
     .await?;
 
     let credentials = Credentials::from_response(&response, now())?;
-    save(&credentials)?;
+    save(&credentials_path()?, &credentials)?;
     Ok(credentials)
 }
 
@@ -145,7 +147,7 @@ async fn request_tokens(client: &reqwest::Client, body: Value) -> Result<Value, 
 
     if !(200..300).contains(&status) {
         return Err(format!(
-            "token request failed with {status}: {text}; run `security delete-generic-password -s {KEYCHAIN_SERVICE}` to sign in again"
+            "token request failed with {status}: {text}; {SIGN_IN_AGAIN}"
         ));
     }
 
@@ -196,41 +198,32 @@ fn pasted_code(input: &str, verifier: &str) -> Result<String, String> {
     Ok(code.to_string())
 }
 
-fn load() -> Result<Option<Credentials>, String> {
-    let output = Command::new("security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
-        .output()
-        .map_err(|error| format!("could not run `security`: {error}"))?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let text = String::from_utf8(output.stdout)
-        .map_err(|error| format!("keychain output was not text: {error}"))?;
-    Credentials::parse(text.trim()).map(Some)
+fn credentials_path() -> Result<PathBuf, String> {
+    let home = std::env::home_dir().ok_or("could not find the home directory")?;
+    Ok(home.join(CREDENTIALS_PATH))
 }
 
-fn save(credentials: &Credentials) -> Result<(), String> {
-    let status = Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-a",
-            KEYCHAIN_SERVICE,
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-w",
-            &credentials.to_json(),
-        ])
-        .status()
-        .map_err(|error| format!("could not run `security`: {error}"))?;
+fn load(path: &Path) -> Result<Option<Credentials>, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Credentials::parse(&text).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("could not read {}: {error}", path.display())),
+    }
+}
 
-    if !status.success() {
-        return Err("could not save credentials to the keychain".to_string());
+fn save(path: &Path, credentials: &Credentials) -> Result<(), String> {
+    let failed = |error: io::Error| format!("could not save {}: {error}", path.display());
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory).map_err(failed)?;
     }
 
-    Ok(())
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path).map_err(failed)?;
+    file.write_all(credentials.to_json().as_bytes())
+        .map_err(failed)
 }
 
 fn now() -> u64 {
@@ -345,6 +338,48 @@ mod tests {
             Credentials::parse(&credentials.to_json()).unwrap(),
             credentials
         );
+    }
+
+    fn temporary_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!("pi-rust-test-{}-{name}", std::process::id()))
+            .join("credentials.json")
+    }
+
+    #[test]
+    fn saves_credentials_to_a_file_and_loads_them_back() {
+        let path = temporary_path("round-trip");
+        let credentials = Credentials {
+            access: "access".to_string(),
+            refresh: "refresh".to_string(),
+            expires: 42,
+        };
+
+        save(&path, &credentials).unwrap();
+
+        assert_eq!(load(&path).unwrap(), Some(credentials));
+    }
+
+    #[test]
+    fn signs_in_when_there_is_no_credentials_file() {
+        assert_eq!(load(&temporary_path("missing")).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_the_credentials_file_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temporary_path("private");
+        let credentials = Credentials {
+            access: "access".to_string(),
+            refresh: "refresh".to_string(),
+            expires: 42,
+        };
+
+        save(&path, &credentials).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
