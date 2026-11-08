@@ -8,10 +8,22 @@ A minimal coding agent for the terminal, written in Rust. It is a proof of conce
 - Rust (edition 2024)
 - A Claude account
 
+## Install
+
+```sh
+cargo install --git https://github.com/ravshansbox/pi-rust
+```
+
+To uninstall:
+
+```sh
+cargo uninstall pi-rust
+```
+
 ## Run
 
 ```sh
-cargo run
+pi-rust
 ```
 
 On first run, pi-rust shows a URL. Open it in your browser, sign in to Claude and paste the code it shows back into the terminal. The credentials are saved in `~/.config/pi-rust/credentials.json`, readable only by you, and refreshed when they expire. Delete the file to sign in again.
@@ -21,8 +33,10 @@ Type a prompt after `>` and press Enter. Press Ctrl+D to quit.
 The model is `claude-opus-5-5` by default. To use another model, pass `--model`:
 
 ```sh
-cargo run -- --model claude-sonnet-5-5
+pi-rust --model claude-sonnet-5-5
 ```
+
+To run from a clone without installing, use `cargo run`. Pass flags after `--`, for example `cargo run -- --model claude-sonnet-5-5`.
 
 ## Tools
 
