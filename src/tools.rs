@@ -70,7 +70,8 @@ pub fn definitions() -> Value {
                 "required": ["command"]
             }
         },
-        {"type": "web_fetch_20250910", "name": "web_fetch"}
+        {"type": "web_fetch_20250910", "name": "web_fetch"},
+        {"type": "web_search_20250305", "name": "web_search"}
     ])
 }
 
@@ -79,6 +80,7 @@ pub fn summary(name: &str, input: &Value) -> String {
         "read" | "write" | "edit" => input.get("path"),
         "bash" => input.get("command"),
         "web_fetch" => input.get("url"),
+        "web_search" => input.get("query"),
         _ => None,
     }
     .and_then(Value::as_str)
@@ -530,6 +532,22 @@ mod tests {
         assert_eq!(
             summary("web_fetch", &json!({"url": "https://example.com"})),
             "web_fetch https://example.com"
+        );
+    }
+
+    #[test]
+    fn offers_web_search_run_by_anthropic() {
+        let definitions = definitions();
+
+        assert!(
+            definitions
+                .as_array()
+                .unwrap()
+                .contains(&json!({"type": "web_search_20250305", "name": "web_search"}))
+        );
+        assert_eq!(
+            summary("web_search", &json!({"query": "rust async"})),
+            "web_search rust async"
         );
     }
 
