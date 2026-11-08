@@ -1,10 +1,10 @@
 use serde_json::{Value, json};
 use std::io::{self, Write};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
+mod auth;
 mod tools;
 
-const CREDENTIALS_SERVICE: &str = "Claude Code-credentials";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -25,8 +25,8 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), String> {
-    let token = access_token(&credentials_json()?)?;
     let client = reqwest::Client::new();
+    let mut credentials = auth::credentials(&client).await?;
     let mut messages: Vec<Value> = Vec::new();
 
     while let Some(prompt) = read_prompt()? {
@@ -37,7 +37,7 @@ async fn run() -> Result<(), String> {
         let checkpoint = messages.len();
         messages.push(json!({"role": "user", "content": prompt}));
 
-        if let Err(message) = converse(&client, &token, &mut messages).await {
+        if let Err(message) = converse(&client, &mut credentials, &mut messages).await {
             eprintln!("{RESET}error: {message}");
             messages.truncate(checkpoint);
         }
@@ -48,11 +48,12 @@ async fn run() -> Result<(), String> {
 
 async fn converse(
     client: &reqwest::Client,
-    token: &str,
+    credentials: &mut auth::Credentials,
     messages: &mut Vec<Value>,
 ) -> Result<(), String> {
     loop {
-        let content = stream_reply(client, token, messages).await?;
+        let token = auth::access_token(client, credentials).await?;
+        let content = stream_reply(client, &token, messages).await?;
         let calls: Vec<Value> = content
             .iter()
             .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
@@ -153,36 +154,6 @@ async fn stream_reply(
     println!();
 
     reply.finish()
-}
-
-fn credentials_json() -> Result<String, String> {
-    let output = Command::new("security")
-        .args(["find-generic-password", "-s", CREDENTIALS_SERVICE, "-w"])
-        .output()
-        .map_err(|error| format!("could not run `security`: {error}"))?;
-
-    if !output.status.success() {
-        return Err(
-            "no Claude Code credentials in the keychain; run `claude` to sign in".to_string(),
-        );
-    }
-
-    String::from_utf8(output.stdout)
-        .map_err(|error| format!("keychain output was not text: {error}"))
-}
-
-fn access_token(credentials: &str) -> Result<String, String> {
-    let value: Value = serde_json::from_str(credentials)
-        .map_err(|error| format!("credentials are not valid JSON: {error}"))?;
-
-    value
-        .get("claudeAiOauth")
-        .and_then(|oauth| oauth.get("accessToken"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            "credentials have no claudeAiOauth.accessToken; run `claude` to sign in".to_string()
-        })
 }
 
 fn request_body(messages: &[Value]) -> Value {
@@ -338,7 +309,7 @@ fn describe_failure(status: u16, body: &Value) -> String {
         .unwrap_or("no message");
 
     let hint = match status {
-        401 | 403 => "; run `claude` to sign in again",
+        401 | 403 => "; run `security delete-generic-password -s pi-rust` to sign in again",
         _ => "",
     };
 
@@ -351,26 +322,6 @@ fn describe_failure(status: u16, body: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const CREDENTIALS: &str =
-        r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test","subscriptionType":"team"}}"#;
-
-    #[test]
-    fn reads_the_access_token() {
-        assert_eq!(access_token(CREDENTIALS).unwrap(), "sk-ant-oat01-test");
-    }
-
-    #[test]
-    fn rejects_credentials_without_a_token() {
-        let error = access_token(r#"{"claudeAiOauth":{}}"#).unwrap_err();
-        assert!(error.contains("claudeAiOauth.accessToken"), "{error}");
-    }
-
-    #[test]
-    fn rejects_credentials_that_are_not_json() {
-        let error = access_token("not json").unwrap_err();
-        assert!(error.contains("not valid JSON"), "{error}");
-    }
 
     #[test]
     fn sends_the_conversation_as_a_cached_stream_with_visible_thinking() {
@@ -503,6 +454,6 @@ mod tests {
         let body = json!({"error": {"type": "authentication_error", "message": "invalid"}});
         let message = describe_failure(401, &body);
         assert!(message.contains("401"), "{message}");
-        assert!(message.contains("run `claude`"), "{message}");
+        assert!(message.contains("delete-generic-password"), "{message}");
     }
 }
