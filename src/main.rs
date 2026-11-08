@@ -10,6 +10,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const MODEL: &str = "claude-opus-5-5";
 const MAX_TOKENS: u32 = 16000;
+const MAX_PAUSES: usize = 5;
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
@@ -51,6 +52,7 @@ async fn converse(
     credentials: &mut auth::Credentials,
     messages: &mut Vec<Value>,
 ) -> Result<(), String> {
+    let mut pauses = 0;
     loop {
         let token = auth::access_token(client, credentials).await?;
         let (content, stop_reason) = stream_reply(client, &token, messages).await?;
@@ -62,8 +64,10 @@ async fn converse(
         messages.push(json!({"role": "assistant", "content": content}));
 
         if stop_reason.as_deref() == Some("pause_turn") {
+            pauses = count_pause(pauses)?;
             continue;
         }
+        pauses = 0;
         if calls.is_empty() {
             return Ok(());
         }
@@ -74,6 +78,15 @@ async fn converse(
         }
         messages.push(json!({"role": "user", "content": results}));
     }
+}
+
+fn count_pause(pauses: usize) -> Result<usize, String> {
+    if pauses >= MAX_PAUSES {
+        return Err(format!(
+            "the server paused the turn more than {MAX_PAUSES} times in a row"
+        ));
+    }
+    Ok(pauses + 1)
 }
 
 async fn use_tool(call: &Value) -> Value {
@@ -476,6 +489,17 @@ mod tests {
                 ],
                 Some("pause_turn".to_string())
             )
+        );
+    }
+
+    #[test]
+    fn stops_a_turn_that_keeps_pausing() {
+        assert_eq!(count_pause(MAX_PAUSES - 1), Ok(MAX_PAUSES));
+
+        let error = count_pause(MAX_PAUSES).unwrap_err();
+        assert_eq!(
+            error,
+            format!("the server paused the turn more than {MAX_PAUSES} times in a row")
         );
     }
 
